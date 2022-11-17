@@ -153,10 +153,18 @@ midi_read_thread(void *arg)
 	}
 }
 
+struct wave_table {
+	float power;
+	float value;
+};
+
+static struct wave_table wave_table[65536];
+
 static float
 wave_function_16(float _x, float _power)
 {
 	uint16_t x = (_x - floorf(_x)) * (1U << 16);
+	uint16_t x_old;
 	float retval;
 	uint8_t num;
 
@@ -176,6 +184,11 @@ wave_function_16(float _x, float _power)
 	default:
 		break;
 	}
+
+	if (wave_table[x].power == _power)
+		return (wave_table[x].value);
+
+	x_old = x;
 
 	/* Apply "grey" encoding */
 	for (uint16_t mask = 1U << 15; mask != 1; mask /= 2) {
@@ -208,6 +221,9 @@ wave_function_16(float _x, float _power)
 	/* Check if halfway */
 	if (x & (1ULL << 14))
 		retval = -retval;
+
+	wave_table[x_old].power = _power;
+	wave_table[x_old].value = retval;
 
 	return (retval);
 }
