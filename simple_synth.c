@@ -132,6 +132,9 @@ midi_read_thread(void *arg)
 			key = midi_read_byte() & 0x7F;
 			vel = midi_read_byte() & 0x7F;
 			switch (key) {
+			case 0x3f:	/* Nord Electro - Effect 1 */
+				wave_form = 0.25f + (vel / 127.0 * 1.75f);
+				break;
 			case 0x40:	/* pedal */
 				pedal_on = vel;
 				break;
