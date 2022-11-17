@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2010-2021 Hans Petter Selasky. All rights reserved.
+ * Copyright (c) 2010-2022 Hans Petter Selasky
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,6 +35,7 @@
 #include <err.h>
 
 #include <sys/soundcard.h>
+#include <sys/queue.h>
 
 static uint8_t base_key = 60;		/* C4 */
 static uint8_t base_chan = 0;
@@ -52,6 +53,7 @@ static uint8_t amplitude_curr[128];
 static pthread_mutex_t Giant;
 static float wave_offset[128];
 static pthread_t midi_thread;
+static float wave_form = 0.5f;	/* cosinus */
 
 static uint8_t
 midi_read_byte(void)
@@ -207,8 +209,55 @@ wave_function_16(float _x, float _power)
 	return (retval);
 }
 
+struct ressonator;
+typedef TAILQ_ENTRY(ressonator) res_entry_t;
+typedef TAILQ_HEAD(,ressonator) res_head_t;
+
+struct ressonator {
+	res_entry_t entry;
+	double k;
+	size_t size;
+	size_t offset;
+	double samples[];
+};
+
 static void
-generate_audio(int32_t *pbuf, uint32_t nsamples)
+ressonator_alloc(double _k, size_t _size, res_head_t *phead)
+{
+	const size_t sz = sizeof(struct ressonator) + sizeof(double) * _size;
+	struct ressonator *pres = malloc(sz);
+	memset(pres, 0, sz);
+	pres->k = _k;
+	pres->size = _size;
+	pres->offset = 0;
+	TAILQ_INSERT_TAIL(phead, pres, entry);
+}
+
+static int32_t
+execute_ressonators(int32_t sample, res_head_t *phead)
+{
+	struct ressonator *pres;
+	double output = 0.0;
+	double num = 0.0;
+
+	if (TAILQ_FIRST(phead) == 0)
+		return (sample);
+
+	TAILQ_FOREACH(pres, phead, entry) {
+		output += pres->samples[pres->offset];
+
+		pres->samples[pres->offset] = pres->samples[pres->offset] * pres->k + sample;
+
+		pres->offset++;
+		if (pres->offset == pres->size)
+			pres->offset = 0;
+		num++;
+	}
+	return (output / num + sample) / 2.0;
+}
+
+static void
+generate_audio(int32_t *pbuf, uint32_t nsamples, res_head_t *phead)
 {
 	uint32_t n;
 	uint8_t j;
@@ -248,8 +297,8 @@ generate_audio(int32_t *pbuf, uint32_t nsamples)
 
 		for (n = 0; n != nsamples; n++) {
 
-			pbuf[n] += ((1LL << 28) / 128.0f) * curr_fact *
-			    wave_function_16(wave_offset[j], 1.0f / (1.0f + curr_fact / 64.0f));
+			pbuf[n] += (1LL << 21) * curr_fact *
+			    wave_function_16(wave_offset[j], wave_form);
 
 			/* advance phase */
 			wave_offset[j] += freq;
@@ -271,6 +320,9 @@ generate_audio(int32_t *pbuf, uint32_t nsamples)
 			amplitude_last[j] = amplitude_curr[j];
 	}
 
+	for (n = 0; n != nsamples; n++)
+		pbuf[n] = execute_ressonators(pbuf[n], phead);
+
 	pthread_mutex_unlock(&Giant);
 }
 
@@ -279,6 +331,8 @@ oss_write_thread(void *arg)
 {
 	const int fmt = AFMT_S32_NE;
 	const int chn = 1;
+
+	res_head_t *phead = (res_head_t *)arg;
 
 	int err;
 	int rem;
@@ -330,7 +384,7 @@ oss_write_thread(void *arg)
 
 			if (rem == 0) {
 				rem = buf_size;
-				generate_audio(buf, buf_size);
+				generate_audio(buf, buf_size, phead);
 			}
 			odly = 0;
 
@@ -363,9 +417,12 @@ usage(void)
 	fprintf(stderr, "Usage: simple_synth [parameters]\n"
 	    "\t" "-k <base_key (60=C5)>\n"
 	    "\t" "-H <base_hz (440Hz)>\n"
+	    "\t" "-R <ressonator_hz, ressonator_decay>\n"
+	    "\t" "-S <ressonator_base_hz, scale_size, ressonator_decay>\n"
 	    "\t" "-o <octave_size (12)>\n"
 	    "\t" "-r <sample_rate (48000Hz)>\n"
 	    "\t" "-d <MIDI device (/dev/umidi0.0)>\n"
+	    "\t" "-w <waveform 0.25 .. 2.0>\n"
 	    "\t" "-f <OSS device (/dev/dsp)>\n");
 
 	exit(1);
@@ -374,9 +431,15 @@ usage(void)
 int
 main(int argc, char **argv)
 {
+	res_head_t head;
+	double freq;
+	double gain;
+	int num;
 	int c;
 
-	while ((c = getopt(argc, argv, "f:k:H:o:r:w:d:n:h")) != -1) {
+	TAILQ_INIT(&head);
+
+	while ((c = getopt(argc, argv, "f:k:H:o:R:S:r:w:d:n:h")) != -1) {
 		switch (c) {
 		case 'k':
 			base_key = atoi(optarg);
@@ -387,17 +450,44 @@ main(int argc, char **argv)
 		case 'o':
 			octave_size = atoi(optarg);
 			if (octave_size == 0)
-				err(1, "-o option requires non-zero value\n");
+				err(1, "-o option requires non-zero value");
 			break;
 		case 'r':
 			sample_rate = atoi(optarg);
 			buf_size = sample_rate / 50;
+			break;
+		case 'R':
+			if (sscanf(optarg, "%lf,%lf", &freq, &gain) != 2)
+				err(1, "Cannot parse -R option");
+			if (freq <= 0.0)
+				err(1, "Ressonator frequency must be above 0Hz");
+			if (gain >= 1.0)
+				err(1, "Gain must be below 1.0");
+			ressonator_alloc(gain, sample_rate / freq, &head);
+			break;
+		case 'S':
+			if (sscanf(optarg, "%lf,%d,%lf", &freq, &num, &gain) != 3)
+				err(1, "Cannot parse -S option");
+			if (freq <= 0.0)
+				err(1, "Ressonator frequency must be above 0Hz");
+			if (gain >= 1.0)
+				err(1, "Gain must be below 1.0");
+			if (num < 1)
+				err(1, "Scale size be above 0");
+			for (int x = 0; x != num; x++) {
+				ressonator_alloc(gain, sample_rate / freq *
+				    pow(2.0,-(double)x / (double)num), &head);
+			}
 			break;
 		case 'd':
 			midi_dev = optarg;
 			break;
 		case 'f':
 			oss_dev = optarg;
+			break;
+		case 'w':
+			if (sscanf(optarg, "%f", &wave_form) != 1)
+				err(1, "Cannot parse -w option");
 			break;
 		default:
 			usage();
@@ -408,7 +498,7 @@ main(int argc, char **argv)
 
 	pthread_create(&midi_thread, NULL, &midi_read_thread, NULL);
 
-	oss_write_thread(NULL);
+	oss_write_thread(&head);
 
 	return (0);			/* not reached */
 }
