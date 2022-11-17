@@ -37,7 +37,7 @@
 #include <sys/soundcard.h>
 #include <sys/queue.h>
 
-static uint8_t base_key = 60;		/* C4 */
+static uint8_t base_key = 57;		/* A4 */
 static uint8_t base_chan = 0;
 static uint16_t base_hz = 440;
 static uint8_t octave_size = 12;
@@ -415,7 +415,7 @@ static void
 usage(void)
 {
 	fprintf(stderr, "Usage: simple_synth [parameters]\n"
-	    "\t" "-k <base_key (60=C5)>\n"
+	    "\t" "-k <base_key (57=A4)>\n"
 	    "\t" "-H <base_hz (440Hz)>\n"
 	    "\t" "-R <ressonator_hz, ressonator_decay>\n"
 	    "\t" "-S <ressonator_base_hz, scale_size, ressonator_decay>\n"
